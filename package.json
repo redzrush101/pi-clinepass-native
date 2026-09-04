@@ -1,0 +1,39 @@
+{
+  "name": "pi-clinepass-native",
+  "version": "0.3.0",
+  "description": "Minimal native ClinePass OAuth provider for Pi with persistent live model discovery.",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "clinepass"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/redzrush101/pi-clinepass-native.git"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.3.5",
+    "typescript": "^5.9.0"
+  },
+  "scripts": {
+    "lint": "biome check .",
+    "typecheck": "tsc -p tsconfig.json",
+    "check": "biome check . && tsc -p tsconfig.json"
+  },
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE"
+  ]
+}

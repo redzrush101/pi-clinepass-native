@@ -1,0 +1,27 @@
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Lint/format and the typechecker.
+      - run: npm ci
+
+      # pi's published type packages, needed to resolve the index.ts imports.
+      # Not in devDependencies: pi runs `npm install` on git packages and
+      # flattening these into the package root would shadow pi's own modules.
+      - run: npm install --no-save @earendil-works/pi-ai @earendil-works/pi-coding-agent
+
+      - run: npm run lint
+      - run: npm run typecheck
