@@ -36,10 +36,11 @@ Reads `GET /api/v1/users/me/plan/usage-limits` with the stored OAuth token
 
 **Auth.** Mirrors Cline's WorkOS device flow and token exchange, verified
 against the Cline source. The access token is sent `workos:`-prefixed, as
-Cline does. The provider uses pi's native OAuth API, so pi owns credential
-persistence and locked token refresh (`~/.pi/agent/auth.json`). ClinePass is a
-personal-account subscription, so the extension also performs Cline's
-best-effort switch to Personal after authentication.
+Cline does. The extension uses pi's supported provider registration and OAuth
+adapter, so pi still owns credential persistence and locked token refresh
+(`~/.pi/agent/auth.json`). ClinePass is a personal-account subscription, so the
+extension also performs Cline's best-effort switch to Personal after
+authentication.
 
 **Model catalog.** Membership and order come from Cline's
 `recommended-models` feed (`clinePass` then `free`). Per-model metadata
@@ -53,11 +54,13 @@ refresh checks the live Cline feed again, while a temporary models.dev failure
 keeps persisted metadata for models that were already known. New unmatched
 models fall back to 128k context / 8k output.
 
-**Inference.** A complete native pi provider uses pi's built-in OpenAI Chat
-Completions transport against `https://api.cline.bot/api/v1`. Cline's
-reasoning metadata is projected into pi thinking levels, including binary
-toggle-only models, without forcing prompt-cache markers globally across the
-different upstream model families.
+**Inference.** The extension delegates `openai-completions` to pi's built-in
+OpenAI Chat Completions transport against `https://api.cline.bot/api/v1`. This
+avoids importing pi-ai transport subpaths, which are not resolvable from
+extensions in the published pi runtime. Cline's reasoning metadata is
+projected into pi thinking levels, including binary toggle-only models, without
+forcing prompt-cache markers globally across the different upstream model
+families.
 
 ## Contributing
 

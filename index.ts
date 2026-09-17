@@ -1,12 +1,4 @@
-import {
-	createProvider,
-	lazyApi,
-	type Model,
-	type OAuthCredential,
-	type OAuthCredentials,
-	type ProviderAuthInteraction,
-	type RefreshModelsContext,
-} from "@earendil-works/pi-ai";
+import type { Model, OAuthCredentials, OAuthLoginCallbacks, RefreshModelsContext } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const PROVIDER_ID = "cline-pass";
@@ -27,8 +19,6 @@ const USAGE_REQUEST_TIMEOUT_MS = 10_000;
 
 const FALLBACK_CONTEXT_WINDOW = 128_000;
 const FALLBACK_MAX_TOKENS = 8_192;
-
-const openAICompletionsApi = () => lazyApi(() => import("@earendil-works/pi-ai/api/openai-completions"));
 
 // The feed spells the same model with a Vercel id (zai/…) while models.dev
 // keys it under the OpenRouter alias (z-ai/…). Check both.
@@ -240,7 +230,7 @@ function idAliases(id: string): string[] {
 	return ids;
 }
 
-export function toCredentials(payload: ClineAuthResponse, fallback?: OAuthCredentials): OAuthCredential {
+export function toCredentials(payload: ClineAuthResponse, fallback?: OAuthCredentials): OAuthCredentials {
 	const data = payload.data;
 	if (!payload.success || !data?.accessToken || !data.expiresAt) {
 		throw new Error("Invalid token response from Cline");
@@ -254,7 +244,7 @@ export function toCredentials(payload: ClineAuthResponse, fallback?: OAuthCreden
 		throw new Error(`Invalid token expiration from Cline: ${data.expiresAt}`);
 	}
 
-	return { type: "oauth", access: data.accessToken, refresh, expires };
+	return { access: data.accessToken, refresh, expires };
 }
 
 // Cline sends the access token as a `workos:`-prefixed bearer.
@@ -564,7 +554,7 @@ async function pollDeviceAuthorization(
 async function registerWorkOSTokens(
 	tokens: { accessToken: string; refreshToken: string },
 	signal: AbortSignal,
-): Promise<OAuthCredential> {
+): Promise<OAuthCredentials> {
 	const response = await fetch(`${CLINE_API}/auth/register`, {
 		method: "POST",
 		headers: clineHeaders(),
@@ -596,12 +586,11 @@ async function selectPersonalAccount(credentials: OAuthCredentials, signal: Abor
 	}
 }
 
-export async function login(interaction: ProviderAuthInteraction): Promise<OAuthCredential> {
-	const signal = interaction.signal;
+export async function login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
+	const signal = callbacks.signal ?? new AbortController().signal;
 	const device = await startDeviceAuthorization(signal);
 
-	interaction.notify({
-		type: "auth_url",
+	callbacks.onAuth({
 		url: device.verificationUriComplete ?? device.verificationUri,
 		instructions: `Enter this code in your browser: ${device.userCode}`,
 	});
@@ -609,11 +598,11 @@ export async function login(interaction: ProviderAuthInteraction): Promise<OAuth
 	const workosTokens = await pollDeviceAuthorization(device, signal);
 	const credentials = await registerWorkOSTokens(workosTokens, signal);
 	await selectPersonalAccount(credentials, signal);
-	interaction.notify({ type: "progress", message: "ClinePass authenticated" });
+	callbacks.onProgress?.("ClinePass authenticated");
 	return credentials;
 }
 
-export async function refresh(credentials: OAuthCredential, signal: AbortSignal): Promise<OAuthCredential> {
+export async function refreshToken(credentials: OAuthCredentials, signal: AbortSignal): Promise<OAuthCredentials> {
 	const response = await fetch(`${CLINE_API}/auth/refresh`, {
 		method: "POST",
 		headers: clineHeaders(),
@@ -672,24 +661,19 @@ export default function clinePassExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerProvider(
-		createProvider({
-			id: PROVIDER_ID,
+	pi.registerProvider(PROVIDER_ID, {
+		name: "ClinePass",
+		baseUrl: CLINE_API,
+		api: "openai-completions",
+		authHeader: true,
+		headers: PROVIDER_HEADERS,
+		refreshModels: (context) => refreshClinePassModels(context),
+		oauth: {
 			name: "ClinePass",
-			baseUrl: CLINE_API,
-			headers: PROVIDER_HEADERS,
-			auth: {
-				oauth: {
-					name: "ClinePass",
-					isSubscription: true,
-					login,
-					refresh,
-					toAuth: async (credentials) => ({ apiKey: getApiKey(credentials) }),
-				},
-			},
-			models: [],
-			fetchModels: (context) => refreshClinePassModels(context),
-			api: openAICompletionsApi(),
-		}),
-	);
+			isSubscription: true,
+			login,
+			refreshToken,
+			getApiKey,
+		},
+	});
 }
