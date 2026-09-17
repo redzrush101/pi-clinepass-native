@@ -43,13 +43,14 @@ extension also performs Cline's best-effort switch to Personal after
 authentication.
 
 **Model catalog.** Membership and order come from Cline's
-`recommended-models` feed (`clinePass` then `free`). Per-model metadata
+`recommended-models` feed (`clinePass`). The feed's `free` bucket is not
+registered because Cline currently restricts those models to Cline product
+surfaces, and the gateway rejects them from Pi. Per-model metadata
 (context/output limits, image support, and reasoning controls) comes from the
 models.dev `openrouter` section, matching current Cline's catalog builder. Full
 id lookup falls back to the model slug and includes the `zai/`↔`z-ai/` alias.
-Both subscription and free models report $0 token cost because ClinePass is
-subscription-backed; the feed bucket decides which entries receive the
-`(free)` label. Pi persists the last successful model list. Each network model
+ClinePass models report $0 token cost because access is subscription-backed.
+Pi persists the last successful model list. Each network model
 refresh checks the live Cline feed again, while a temporary models.dev failure
 keeps persisted metadata for models that were already known. New unmatched
 models fall back to 128k context / 8k output.

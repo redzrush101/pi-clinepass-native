@@ -388,34 +388,27 @@ export function mapCatalog(
 ): PiModel[] {
 	const cachedById = new Map(cached.map((model) => [model.id, model]));
 	const models: PiModel[] = [];
-	const seen = new Set<string>();
 
-	const append = (entry: RecommendedEntry, free: boolean) => {
+	for (const entry of payload.clinePass ?? []) {
 		const id = entry.id?.trim();
-		if (!id || seen.has(id)) return;
+		if (!id) continue;
 
 		const base = genericModel(entry, cachedById.get(id));
-		if (!base) return;
+		if (!base) continue;
 
 		const metadata = metadataFor(id, catalog);
-		let model = enrichModel(base, metadata);
-		const displayName = metadata?.name?.trim() || entry.name?.trim() || model.name || id;
-		model = {
+		const model = enrichModel(base, metadata);
+		models.push({
 			...model,
 			api: "openai-completions",
 			provider: PROVIDER_ID,
 			baseUrl: CLINE_API,
 			headers: PROVIDER_HEADERS,
-			name: free ? `${displayName.replace(/\s*\(free\)\s*$/i, "")} (free)` : displayName,
+			name: metadata?.name?.trim() || entry.name?.trim() || model.name || id,
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		};
+		});
+	}
 
-		seen.add(id);
-		models.push(model);
-	};
-
-	for (const entry of payload.clinePass ?? []) append(entry, false);
-	for (const entry of payload.free ?? []) append(entry, true);
 	return models;
 }
 
