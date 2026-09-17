@@ -1,10 +1,12 @@
-import type {
-	Model,
-	ModelsStoreEntry,
-	OAuthCredentials,
-	OAuthLoginCallbacks,
-	RefreshModelsContext,
+import {
+	createProvider,
+	type Model,
+	type OAuthCredential,
+	type OAuthCredentials,
+	type ProviderAuthInteraction,
+	type RefreshModelsContext,
 } from "@earendil-works/pi-ai";
+import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const PROVIDER_ID = "cline-pass";
@@ -17,9 +19,8 @@ const WORKOS_API = "https://api.workos.com";
 // Public OAuth client id from Cline's own device-login flow (production env).
 const WORKOS_CLIENT_ID = "client_01K3A541FN8TA3EPPHTD2325AR";
 const WORKOS_PREFIX = "workos:";
+const PROVIDER_HEADERS = { "User-Agent": "pi-clinepass-native" } as const;
 
-// Same 10-minute catalog TTL as Cline's live provider catalog.
-const MODEL_CACHE_TTL_MS = 10 * 60_000;
 const CATALOG_REQUEST_TIMEOUT_MS = 5_000;
 const AUTH_REQUEST_TIMEOUT_MS = 30_000;
 const USAGE_REQUEST_TIMEOUT_MS = 10_000;
@@ -35,18 +36,7 @@ const PI_THINKING_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"] 
 type PiThinkingLevel = "off" | (typeof PI_THINKING_LEVELS)[number];
 type PiThinkingLevelMap = Partial<Record<PiThinkingLevel, string | null>>;
 
-type PiModel = {
-	id: string;
-	name: string;
-	reasoning: boolean;
-	thinkingLevelMap?: PiThinkingLevelMap;
-	input: ("text" | "image")[];
-	cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
-	contextWindow: number;
-	maxTokens: number;
-};
-
-type StoredPiModel = Model<"openai-completions">;
+type PiModel = Model<"openai-completions">;
 
 type RecommendedEntry = {
 	id?: string;
@@ -74,7 +64,6 @@ type ModelsDevModel = {
 	reasoning_options?: ModelsDevReasoningOption[];
 	status?: string;
 	limit?: { context?: number; input?: number; output?: number };
-	cost?: { input?: number; output?: number; cache_read?: number; cache_write?: number };
 	modalities?: { input?: string[]; output?: string[] };
 };
 
@@ -249,7 +238,7 @@ function idAliases(id: string): string[] {
 	return ids;
 }
 
-export function toCredentials(payload: ClineAuthResponse, fallback?: OAuthCredentials): OAuthCredentials {
+export function toCredentials(payload: ClineAuthResponse, fallback?: OAuthCredentials): OAuthCredential {
 	const data = payload.data;
 	if (!payload.success || !data?.accessToken || !data.expiresAt) {
 		throw new Error("Invalid token response from Cline");
@@ -263,7 +252,7 @@ export function toCredentials(payload: ClineAuthResponse, fallback?: OAuthCreden
 		throw new Error(`Invalid token expiration from Cline: ${data.expiresAt}`);
 	}
 
-	return { access: data.accessToken, refresh, expires };
+	return { type: "oauth", access: data.accessToken, refresh, expires };
 }
 
 // Cline sends the access token as a `workos:`-prefixed bearer.
@@ -294,34 +283,49 @@ function indexSection(section: { models?: Record<string, ModelsDevModel> } | und
 	return { byId, bySlug };
 }
 
-export function buildCatalog(payload: ModelsDevCatalog | undefined): {
-	cline: ModelIndex;
-	clinePass: ModelIndex;
-	openRouter: ModelIndex;
-} {
-	return {
-		cline: indexSection(payload?.cline),
-		clinePass: indexSection(payload?.["cline-pass"]),
-		openRouter: indexSection(payload?.openrouter),
-	};
+export function buildCatalog(payload: ModelsDevCatalog | undefined): ModelIndex {
+	return indexSection(payload?.openrouter);
 }
 
 export function reasoningLevelMap(
 	options: readonly ModelsDevReasoningOption[] | undefined,
 ): PiThinkingLevelMap | undefined {
-	const efforts = options?.flatMap((option) => (option.type === "effort" ? (option.values ?? []) : [])) ?? [];
-	if (efforts.length === 0) return undefined;
-
+	if (options === undefined) return undefined;
+	const hasToggle = options.some((option) => option.type === "toggle");
+	const efforts = options.flatMap((option) => (option.type === "effort" ? (option.values ?? []) : []));
 	const supported = new Set(efforts);
-	if (!supported.has("none") && !PI_THINKING_LEVELS.some((level) => supported.has(level))) {
+	const activeEfforts = PI_THINKING_LEVELS.filter((level) => supported.has(level));
+	if (!hasToggle && !supported.has("none") && activeEfforts.length === 0) {
 		return undefined;
 	}
 
-	const map: PiThinkingLevelMap = { off: supported.has("none") ? "none" : null };
+	const map: PiThinkingLevelMap = { off: hasToggle || supported.has("none") ? "none" : null };
+	if (activeEfforts.length === 0 && hasToggle) {
+		for (const level of PI_THINKING_LEVELS) map[level] = level === "medium" ? "medium" : null;
+		return map;
+	}
+
 	for (const level of PI_THINKING_LEVELS) {
 		map[level] = supported.has(level) ? level : null;
 	}
 	return map;
+}
+
+function reasoningCompat(options: readonly ModelsDevReasoningOption[] | undefined): PiModel["compat"] | undefined {
+	if (options === undefined) return undefined;
+	const hasToggle = options.some((option) => option.type === "toggle");
+	const hasEffort = options.some(
+		(option) => option.type === "effort" && (option.values ?? []).some((value) => value !== null && value !== "none"),
+	);
+	// Pi's Together-compatible shape is the same pair Cline's gateway accepts
+	// for toggle models: reasoning.enabled plus reasoning_effort when available.
+	if (hasToggle) {
+		return { thinkingFormat: "together", supportsReasoningEffort: hasEffort };
+	}
+	if (hasEffort) {
+		return { thinkingFormat: "openai", supportsReasoningEffort: true };
+	}
+	return { thinkingFormat: "openai", supportsReasoningEffort: false };
 }
 
 function genericModel(entry: RecommendedEntry, existing?: PiModel): PiModel | undefined {
@@ -333,6 +337,10 @@ function genericModel(entry: RecommendedEntry, existing?: PiModel): PiModel | un
 	return {
 		id,
 		name: entry.name?.trim() || id,
+		api: "openai-completions",
+		provider: PROVIDER_ID,
+		baseUrl: CLINE_API,
+		headers: PROVIDER_HEADERS,
 		reasoning: true,
 		input: ["text"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -347,19 +355,22 @@ function enrichModel(base: PiModel, metadata: ModelsDevModel | undefined): PiMod
 	const inputs = metadata.modalities?.input;
 	const supportsImages = Array.isArray(inputs) ? inputs.includes("image") : base.input.includes("image");
 	const thinkingLevelMap = reasoningLevelMap(metadata.reasoning_options);
+	const compat = reasoningCompat(metadata.reasoning_options);
+	const reasoning =
+		metadata.reasoning === false
+			? false
+			: metadata.reasoning_options !== undefined
+				? thinkingLevelMap !== undefined
+				: (metadata.reasoning ?? base.reasoning);
 
 	return {
 		...base,
 		name: metadata.name?.trim() || base.name,
-		reasoning: metadata.reasoning ?? base.reasoning,
-		...(thinkingLevelMap ? { thinkingLevelMap } : {}),
+		reasoning,
+		...(metadata.reasoning_options !== undefined ? { thinkingLevelMap } : {}),
+		...(compat ? { compat: { ...base.compat, ...compat } } : {}),
 		input: supportsImages ? ["text", "image"] : ["text"],
-		cost: {
-			input: nonNegativeNumber(metadata.cost?.input) ?? base.cost.input,
-			output: nonNegativeNumber(metadata.cost?.output) ?? base.cost.output,
-			cacheRead: nonNegativeNumber(metadata.cost?.cache_read) ?? base.cost.cacheRead,
-			cacheWrite: nonNegativeNumber(metadata.cost?.cache_write) ?? base.cost.cacheWrite,
-		},
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: positiveNumber(metadata.limit?.context) ?? base.contextWindow,
 		maxTokens: positiveNumber(metadata.limit?.output) ?? base.maxTokens,
 	};
@@ -374,13 +385,8 @@ function lookup(index: ModelIndex, id: string): ModelsDevModel | undefined {
 	return undefined;
 }
 
-// Subscription models resolve against the cline-pass section then openrouter;
-// free models against cline then openrouter (Cline's own lookup order).
-function metadataFor(id: string, free: boolean, catalog: ReturnType<typeof buildCatalog>): ModelsDevModel | undefined {
-	if (free) {
-		return lookup(catalog.cline, id) ?? lookup(catalog.openRouter, id);
-	}
-	return lookup(catalog.clinePass, id) ?? lookup(catalog.openRouter, id);
+function metadataFor(id: string, catalog: ReturnType<typeof buildCatalog>): ModelsDevModel | undefined {
+	return lookup(catalog, id);
 }
 
 export function mapCatalog(
@@ -399,19 +405,18 @@ export function mapCatalog(
 		const base = genericModel(entry, cachedById.get(id));
 		if (!base) return;
 
-		const metadata = metadataFor(id, free, catalog);
+		const metadata = metadataFor(id, catalog);
 		let model = enrichModel(base, metadata);
-
-		// Free-tier models bill at $0 through Cline regardless of the upstream
-		// list price in the metadata.
-		if (free) {
-			const displayName = metadata?.name?.trim() || entry.name?.trim() || model.name || id;
-			model = {
-				...model,
-				name: id.startsWith("cline-free/") ? `${displayName.replace(/\s*\(free\)\s*$/i, "")} (free)` : displayName,
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-			};
-		}
+		const displayName = metadata?.name?.trim() || entry.name?.trim() || model.name || id;
+		model = {
+			...model,
+			api: "openai-completions",
+			provider: PROVIDER_ID,
+			baseUrl: CLINE_API,
+			headers: PROVIDER_HEADERS,
+			name: free ? `${displayName.replace(/\s*\(free\)\s*$/i, "")} (free)` : displayName,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		};
 
 		seen.add(id);
 		models.push(model);
@@ -422,28 +427,10 @@ export function mapCatalog(
 	return models;
 }
 
-function toStoredModels(models: readonly PiModel[]): StoredPiModel[] {
-	return models.map((model) => ({
-		...model,
-		provider: PROVIDER_ID,
-		api: "openai-completions" as const,
-		baseUrl: CLINE_API,
-	}));
-}
-
-function fromStoredModels(entry: Readonly<ModelsStoreEntry> | undefined): PiModel[] {
-	return (entry?.models ?? [])
-		.filter((model) => model.provider === PROVIDER_ID && typeof model.id === "string")
-		.map((model) => ({
-			id: model.id,
-			name: model.name,
-			reasoning: model.reasoning,
-			...(model.thinkingLevelMap ? { thinkingLevelMap: { ...model.thinkingLevelMap } } : {}),
-			input: [...model.input],
-			cost: { ...model.cost },
-			contextWindow: model.contextWindow,
-			maxTokens: model.maxTokens,
-		}));
+function cachedModels(context: RefreshModelsContext): PiModel[] {
+	return (context.stored?.models ?? []).filter(
+		(model): model is PiModel => model.provider === PROVIDER_ID && model.api === "openai-completions",
+	);
 }
 
 async function fetchModelCatalog(
@@ -463,100 +450,37 @@ async function fetchModelCatalog(
 	}
 }
 
-type CatalogFetchResult = {
-	payload?: RecommendedModelsResponse;
-	catalog?: ReturnType<typeof buildCatalog>;
-	etag?: string;
-	lastModified?: number;
-	notModified: boolean;
-};
-
-async function fetchCatalog(
+async function fetchRecommendedModels(
 	fetchImpl: typeof fetch,
 	signal: AbortSignal,
-	validators?: { etag?: string; lastModified?: number },
-): Promise<CatalogFetchResult> {
-	const headers: Record<string, string> = { Accept: "application/json" };
-	if (validators?.etag) headers["If-None-Match"] = validators.etag;
-	if (validators?.lastModified) headers["If-Modified-Since"] = new Date(validators.lastModified).toUTCString();
-
+): Promise<RecommendedModelsResponse> {
 	// Membership comes from the Cline feed; if it is down there is nothing to
 	// enrich, so check it before spending a request on models.dev.
 	const response = await fetchImpl(MODELS_URL, {
-		headers,
+		headers: { Accept: "application/json" },
 		signal: requestSignal(signal, CATALOG_REQUEST_TIMEOUT_MS),
 	});
-
-	if (response.status !== 304 && !response.ok) {
+	if (!response.ok) {
 		throw new Error(`Failed to fetch ClinePass models: ${await errorText(response)}`);
 	}
-
-	const catalog = await fetchModelCatalog(fetchImpl, signal);
-	if (response.status === 304) return { catalog, notModified: true };
-
-	const parsedLastModified = Date.parse(response.headers.get("last-modified") ?? "");
-	return {
-		payload: (await response.json()) as RecommendedModelsResponse,
-		catalog,
-		etag: response.headers.get("etag") ?? undefined,
-		lastModified: Number.isNaN(parsedLastModified) ? undefined : parsedLastModified,
-		notModified: false,
-	};
+	return (await response.json()) as RecommendedModelsResponse;
 }
 
 export async function refreshClinePassModels(
 	context: RefreshModelsContext,
 	fetchImpl: typeof fetch = fetch,
 ): Promise<PiModel[]> {
-	const cached = fromStoredModels(context.stored);
-
-	// Cache-only phase restores the persisted list with no network or auth.
+	const cached = cachedModels(context);
 	if (!context.allowNetwork) return cached;
 
-	if (
-		!context.force &&
-		cached.length > 0 &&
-		context.stored?.checkedAt !== undefined &&
-		Date.now() - context.stored.checkedAt < MODEL_CACHE_TTL_MS
-	) {
-		return cached;
-	}
-
-	const result = await fetchCatalog(fetchImpl, context.signal, {
-		etag: cached.length ? context.stored?.etag : undefined,
-		lastModified: cached.length ? context.stored?.lastModified : undefined,
-	});
+	const payload = await fetchRecommendedModels(fetchImpl, context.signal);
+	const catalog = await fetchModelCatalog(fetchImpl, context.signal);
 	context.signal.throwIfAborted();
-	const checkedAt = Date.now();
 
-	if (result.notModified && context.stored) {
-		// Feed unchanged; re-enrich in case models.dev metadata improved, but
-		// keep each cached model's cost so a free model is not re-priced.
-		const models = result.catalog
-			? cached.map((model) => ({
-					...enrichModel(model, metadataFor(model.id, false, result.catalog!)),
-					cost: model.cost,
-				}))
-			: cached;
-		await context.publish({
-			persist: { ...context.stored, models: toStoredModels(models), checkedAt },
-		});
-		return models;
-	}
-
-	const models = mapCatalog(result.payload ?? {}, result.catalog, cached);
+	const models = mapCatalog(payload, catalog, cached);
 	if (models.length === 0) {
 		throw new Error("Cline returned no ClinePass models");
 	}
-
-	await context.publish({
-		persist: {
-			models: toStoredModels(models),
-			checkedAt,
-			etag: result.etag,
-			lastModified: result.lastModified,
-		},
-	});
 	return models;
 }
 
@@ -594,13 +518,13 @@ async function startDeviceAuthorization(signal?: AbortSignal): Promise<{
 
 async function pollDeviceAuthorization(
 	device: { deviceCode: string; expiresInSeconds: number; intervalSeconds: number },
-	signal?: AbortSignal,
+	signal: AbortSignal,
 ): Promise<{ accessToken: string; refreshToken: string }> {
 	const deadline = Date.now() + device.expiresInSeconds * 1000;
 	let intervalSeconds = Math.max(1, device.intervalSeconds);
 
 	while (Date.now() <= deadline) {
-		signal?.throwIfAborted();
+		signal.throwIfAborted();
 		const response = await fetch(`${WORKOS_API}/user_management/authenticate`, {
 			method: "POST",
 			headers: clineHeaders("application/x-www-form-urlencoded"),
@@ -622,7 +546,7 @@ async function pollDeviceAuthorization(
 			continue;
 		}
 		if (data.error === "slow_down") {
-			intervalSeconds += 1;
+			intervalSeconds += 5;
 			await sleep(intervalSeconds * 1000, signal);
 			continue;
 		}
@@ -637,8 +561,8 @@ async function pollDeviceAuthorization(
 
 async function registerWorkOSTokens(
 	tokens: { accessToken: string; refreshToken: string },
-	signal?: AbortSignal,
-): Promise<OAuthCredentials> {
+	signal: AbortSignal,
+): Promise<OAuthCredential> {
 	const response = await fetch(`${CLINE_API}/auth/register`, {
 		method: "POST",
 		headers: clineHeaders(),
@@ -651,9 +575,9 @@ async function registerWorkOSTokens(
 	return toCredentials((await response.json()) as ClineAuthResponse);
 }
 
-// Not part of Cline's login. This makes usage-limit reads land on the personal
-// account; a failure here does not affect authentication.
-async function selectPersonalAccount(credentials: OAuthCredentials, signal?: AbortSignal): Promise<void> {
+// ClinePass subscriptions are personal-account only. Cline switches to Personal
+// when this provider is selected; do the same after successful authentication.
+async function selectPersonalAccount(credentials: OAuthCredentials, signal: AbortSignal): Promise<void> {
 	try {
 		const response = await fetch(`${CLINE_API}/users/active-account`, {
 			method: "PUT",
@@ -666,30 +590,28 @@ async function selectPersonalAccount(credentials: OAuthCredentials, signal?: Abo
 		});
 		if (!response.ok) await response.body?.cancel().catch(() => {});
 	} catch (error) {
-		if (signal?.aborted) throw error;
+		if (signal.aborted) throw error;
 	}
 }
 
-export async function login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-	const signal = callbacks.signal;
+export async function login(interaction: ProviderAuthInteraction): Promise<OAuthCredential> {
+	const signal = interaction.signal;
 	const device = await startDeviceAuthorization(signal);
 
-	callbacks.onDeviceCode({
-		userCode: device.userCode,
-		verificationUri: device.verificationUri,
-		intervalSeconds: device.intervalSeconds,
-		expiresInSeconds: device.expiresInSeconds,
+	interaction.notify({
+		type: "auth_url",
+		url: device.verificationUriComplete ?? device.verificationUri,
+		instructions: `Enter this code in your browser: ${device.userCode}`,
 	});
-	callbacks.onAuth({ url: device.verificationUriComplete ?? device.verificationUri });
 
 	const workosTokens = await pollDeviceAuthorization(device, signal);
 	const credentials = await registerWorkOSTokens(workosTokens, signal);
 	await selectPersonalAccount(credentials, signal);
-	callbacks.onProgress?.("ClinePass authenticated");
+	interaction.notify({ type: "progress", message: "ClinePass authenticated" });
 	return credentials;
 }
 
-export async function refreshToken(credentials: OAuthCredentials, signal: AbortSignal): Promise<OAuthCredentials> {
+export async function refresh(credentials: OAuthCredential, signal: AbortSignal): Promise<OAuthCredential> {
 	const response = await fetch(`${CLINE_API}/auth/refresh`, {
 		method: "POST",
 		headers: clineHeaders(),
@@ -748,21 +670,24 @@ export default function clinePassExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerProvider(PROVIDER_ID, {
-		name: "ClinePass",
-		baseUrl: CLINE_API,
-		api: "openai-completions",
-		authHeader: true,
-		headers: {
-			"User-Agent": "pi-clinepass-native",
-		},
-		refreshModels: (context) => refreshClinePassModels(context),
-		oauth: {
+	pi.registerProvider(
+		createProvider({
+			id: PROVIDER_ID,
 			name: "ClinePass",
-			isSubscription: true,
-			login,
-			refreshToken,
-			getApiKey,
-		},
-	});
+			baseUrl: CLINE_API,
+			headers: PROVIDER_HEADERS,
+			auth: {
+				oauth: {
+					name: "ClinePass",
+					isSubscription: true,
+					login,
+					refresh,
+					toAuth: async (credentials) => ({ apiKey: getApiKey(credentials) }),
+				},
+			},
+			models: [],
+			fetchModels: (context) => refreshClinePassModels(context),
+			api: openAICompletionsApi(),
+		}),
+	);
 }
