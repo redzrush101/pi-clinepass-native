@@ -1,12 +1,12 @@
 import {
 	createProvider,
+	lazyApi,
 	type Model,
 	type OAuthCredential,
 	type OAuthCredentials,
 	type ProviderAuthInteraction,
 	type RefreshModelsContext,
 } from "@earendil-works/pi-ai";
-import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const PROVIDER_ID = "cline-pass";
@@ -27,6 +27,8 @@ const USAGE_REQUEST_TIMEOUT_MS = 10_000;
 
 const FALLBACK_CONTEXT_WINDOW = 128_000;
 const FALLBACK_MAX_TOKENS = 8_192;
+
+const openAICompletionsApi = () => lazyApi(() => import("@earendil-works/pi-ai/api/openai-completions"));
 
 // The feed spells the same model with a Vercel id (zai/…) while models.dev
 // keys it under the OpenRouter alias (z-ai/…). Check both.
